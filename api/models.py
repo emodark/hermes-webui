@@ -3199,6 +3199,11 @@ def _sqlite_file_stat_cache_key(db_path: Path):
     )
 
 
+def _lmdb_file_stat_cache_key(lmdb_path: Path) -> tuple:
+    """Return a cheap invalidation key for an LMDB directory (data.mdb)."""
+    return _path_stat_cache_key(lmdb_path / 'data.mdb')
+
+
 def _resolve_cli_sessions_context():
     # Use the active WebUI profile's HERMES_HOME to find state.db.
     # The active profile is determined by what the user has selected in the UI
@@ -3221,25 +3226,87 @@ def _resolve_cli_sessions_context():
         cli_profile = None
 
     db_path = hermes_home / 'state.db'
+    lmdb_path = hermes_home / 'state.lmdb'
     projects_dir = _default_claude_code_projects_dir()
     cache_key = (
         str(hermes_home),
         str(cli_profile or ''),
         str(db_path),
+        str(lmdb_path),
         _sqlite_file_stat_cache_key(db_path),
+        _lmdb_file_stat_cache_key(lmdb_path) if lmdb_path.exists() else '',
         _path_cache_key(projects_dir),
         _path_stat_cache_key(projects_dir),
         _path_stat_cache_key(SESSION_INDEX_FILE),
     )
-    return hermes_home, db_path, cli_profile, cache_key
+    return hermes_home, db_path, lmdb_path, cli_profile, cache_key
 
 
-def _load_cli_sessions_uncached(hermes_home: Path, db_path: Path, _cli_profile) -> list:
+def _load_cli_sessions_uncached(hermes_home: Path, db_path: Path, lmdb_path, _cli_profile) -> list:
     cli_sessions = []
     try:
         cli_sessions.extend(get_claude_code_sessions())
     except Exception:
         logger.debug("Claude Code session scan failed", exc_info=True)
+
+    # ── LMDB mode ──
+    if lmdb_path and lmdb_path.exists():
+        try:
+            from hermes_state import SessionDB
+            db = SessionDB()
+            for session_dict in db.search_sessions(limit=CLI_VISIBLE_SESSION_LIMIT):
+                sid = session_dict.get('id') or session_dict.get('session_id') or ''
+                raw_ts = session_dict.get('last_activity') or session_dict.get('started_at')
+                _source = session_dict.get('source') or 'cli'
+                _title = session_dict.get('title') or ''
+                profile = _cli_profile
+                # If a WebUI JSON file exists for this session, prefer its title
+                try:
+                    _webui_meta = Session.load_metadata_only(sid)
+                    if _webui_meta and getattr(_webui_meta, 'title', None):
+                        _title = _webui_meta.title
+                except Exception:
+                    pass
+                _display_title = _title or f'{_source.title()} Session'
+                cli_sessions.append({
+                    'session_id': sid,
+                    'title': _display_title,
+                    'workspace': str(get_last_workspace()),
+                    'model': session_dict.get('model') or None,
+                    'message_count': session_dict.get('message_count') or session_dict.get('actual_message_count') or 0,
+                    'created_at': session_dict.get('started_at'),
+                    'updated_at': raw_ts,
+                    'pinned': False,
+                    'archived': False,
+                    'project_id': None,
+                    'profile': profile,
+                    'source_tag': _source,
+                    'raw_source': session_dict.get('raw_source'),
+                    'user_id': session_dict.get('user_id'),
+                    'chat_id': session_dict.get('chat_id') or session_dict.get('origin_chat_id'),
+                    'chat_type': session_dict.get('chat_type'),
+                    'thread_id': session_dict.get('thread_id'),
+                    'session_key': session_dict.get('session_key'),
+                    'platform': session_dict.get('platform'),
+                    'session_source': session_dict.get('session_source'),
+                    'source_label': session_dict.get('source_label'),
+                    'parent_session_id': session_dict.get('parent_session_id'),
+                    'parent_title': session_dict.get('parent_title'),
+                    'parent_source': session_dict.get('parent_source'),
+                    'relationship_type': session_dict.get('relationship_type'),
+                    '_parent_lineage_root_id': session_dict.get('_parent_lineage_root_id'),
+                    'end_reason': session_dict.get('end_reason'),
+                    'actual_message_count': session_dict.get('actual_message_count'),
+                    'user_message_count': session_dict.get('actual_user_message_count'),
+                    '_lineage_root_id': session_dict.get('_lineage_root_id'),
+                    '_lineage_tip_id': session_dict.get('_lineage_tip_id'),
+                    '_compression_segment_count': session_dict.get('_compression_segment_count'),
+                    'is_cli_session': True,
+                })
+            db.close()
+            return cli_sessions
+        except Exception:
+            logger.debug("LMDB session load failed, falling back to SQLite", exc_info=True)
 
     if not db_path.exists():
         return cli_sessions
@@ -3341,7 +3408,7 @@ def get_cli_sessions() -> list:
     Returns empty list if the SQLite DB is missing or any error occurs -- the
     bridge is purely additive and never crashes the WebUI.
     """
-    hermes_home, db_path, cli_profile, cache_key = _resolve_cli_sessions_context()
+    hermes_home, db_path, lmdb_path, cli_profile, cache_key = _resolve_cli_sessions_context()
     ttl = _cli_sessions_cache_ttl_seconds()
     now = time.monotonic()
 
@@ -3354,7 +3421,7 @@ def get_cli_sessions() -> list:
                     return _copy_cli_sessions(cached_sessions)
                 _CLI_SESSIONS_CACHE.pop(cache_key, None)
             try:
-                sessions = _load_cli_sessions_uncached(hermes_home, db_path, cli_profile)
+                sessions = _load_cli_sessions_uncached(hermes_home, db_path, lmdb_path, cli_profile)
             except Exception as _cli_err:
                 logger.warning(
                     "get_cli_sessions() failed — check state.db schema or path (%s): %s",
@@ -3368,7 +3435,7 @@ def get_cli_sessions() -> list:
             return _copy_cli_sessions(sessions)
 
     try:
-        return _load_cli_sessions_uncached(hermes_home, db_path, cli_profile)
+        return _load_cli_sessions_uncached(hermes_home, db_path, lmdb_path, cli_profile)
     except Exception as _cli_err:
         logger.warning(
             "get_cli_sessions() failed — check state.db schema or path (%s): %s",
@@ -3876,6 +3943,45 @@ def get_cli_session_messages(sid) -> list:
     """
     if str(sid or '').startswith(f'{CLAUDE_CODE_SOURCE}_'):
         return get_claude_code_session_messages(sid)
+
+    # ── LMDB mode ──
+    try:
+        from hermes_state import SessionDB
+        import os as _os
+        try:
+            from api.profiles import get_active_hermes_home
+            hermes_home = Path(get_active_hermes_home()).expanduser().resolve()
+        except Exception:
+            hermes_home = Path(_os.getenv('HERMES_HOME', str(HOME / '.hermes'))).expanduser().resolve()
+        lmdb_path = hermes_home / 'state.lmdb'
+        if lmdb_path.exists():
+            db = SessionDB()
+            msgs = db.get_messages(sid)
+            db.close()
+            if msgs and isinstance(msgs, list):
+                # Convert to the same dict format as get_state_db_session_messages
+                result = []
+                for msg in msgs:
+                    if not isinstance(msg, dict):
+                        continue
+                    entry = {
+                        'role': msg.get('role', 'user'),
+                        'content': msg.get('content', ''),
+                        'timestamp': msg.get('timestamp'),
+                    }
+                    for col in ('tool_call_id', 'tool_calls', 'tool_name', 'reasoning',
+                                'reasoning_details', 'codex_reasoning_items',
+                                'reasoning_content', 'codex_message_items', 'id', 'name'):
+                        val = msg.get(col)
+                        if val is not None:
+                            entry[col] = val
+                    if entry.get('role') == 'tool' and entry.get('tool_name') and not entry.get('name'):
+                        entry['name'] = entry['tool_name']
+                    result.append(entry)
+                return result
+    except Exception:
+        logger.debug("LMDB get_messages failed, falling back to SQLite", exc_info=True)
+
     return get_state_db_session_messages(sid, stitch_continuations=True)
 
 
@@ -3972,6 +4078,24 @@ def delete_cli_session(sid) -> bool:
     """Delete a CLI session from state.db (messages + session row).
     Returns True if deleted, False if not found or error.
     """
+    # ── LMDB mode ──
+    try:
+        from hermes_state import SessionDB
+        import os as _os
+        try:
+            from api.profiles import get_active_hermes_home
+            hermes_home = Path(get_active_hermes_home()).expanduser().resolve()
+        except Exception:
+            hermes_home = Path(_os.getenv('HERMES_HOME', str(HOME / '.hermes'))).expanduser().resolve()
+        lmdb_path = hermes_home / 'state.lmdb'
+        if lmdb_path.exists():
+            db = SessionDB()
+            result = db.delete_session(sid)
+            db.close()
+            return result
+    except Exception:
+        logger.debug("LMDB delete failed, falling back to SQLite", exc_info=True)
+
     import os
     try:
         import sqlite3

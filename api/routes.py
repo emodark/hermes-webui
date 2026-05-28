@@ -3165,6 +3165,27 @@ def _llm_wiki_config_path() -> str | None:
     )
 
 
+def _llm_wiki_config_enabled() -> bool | None:
+    """Read ``skills.config.wiki.enabled`` from config.yaml.
+
+    Returns ``None`` when the key isn't present (caller decides default),
+    otherwise the bool value from config.
+    """
+    try:
+        from api.config import get_config as _get_cfg
+        cfg = _get_cfg()
+    except Exception:
+        return None
+    raw = _llm_wiki_get_config_path_value(cfg, "skills.config.wiki.enabled")
+    if raw is None:
+        raw = _llm_wiki_get_config_path_value(cfg, "wiki.enabled")
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() in ("true", "1", "yes")
+
+
 # Cap WIKI walks to prevent self-DoS if WIKI_PATH points at /, /etc, /home, etc.
 # Real LLM wikis have under a few thousand files; 10k is generous and catches misconfig.
 _LLM_WIKI_MAX_FILES = 10000
@@ -3234,8 +3255,14 @@ def _llm_wiki_page_files(wiki_path: Path) -> list[Path]:
         return pages
     iterated = 0
     for dirname in _LLM_WIKI_PAGE_DIRS:
-        section = wiki_path / dirname
-        if not section.exists() or not section.is_dir():
+        # Try wiki/entities/ first, then wiki/docs/entities/ for mkdocs-style layouts
+        candidates = [wiki_path / dirname, wiki_path / "docs" / dirname]
+        section = None
+        for candidate in candidates:
+            if candidate.exists() and candidate.is_dir():
+                section = candidate
+                break
+        if section is None:
             continue
         for item in section.rglob("*.md"):
             iterated += 1
@@ -3265,10 +3292,21 @@ def _build_llm_wiki_status() -> dict:
             "last_writer": None,
             "path_configured": path_configured,
             "path_source": path_source,
-            "toggle_available": False,
-            "toggle_reason": "Hermes Agent exposes WIKI_PATH/wiki.path for location, but no stable on/off config flag is currently available.",
+            "toggle_available": True,
+            "toggle_enabled": True,
+            "toggle_reason": "",
             "docs_url": _LLM_WIKI_DOCS_URL,
         }
+        # Read on/off flag from config
+        toggle_flag = _llm_wiki_config_enabled()
+        if toggle_flag is not None:
+            base["toggle_enabled"] = toggle_flag
+            if not toggle_flag:
+                base["enabled"] = False
+                base["status"] = "disabled"
+                base["toggle_reason"] = "LLM Wiki is disabled via wiki.enabled config flag."
+                return base
+        base["toggle_reason"] = "Config flag skills.config.wiki.enabled is available."
         if not wiki_path.exists():
             return base
         if not wiki_path.is_dir():
@@ -3292,7 +3330,7 @@ def _build_llm_wiki_status() -> dict:
             "status": "ready" if page_files else "empty",
             "entry_count": len(page_files),
             "page_count": len(page_files),
-            "raw_source_count": _llm_wiki_count_files(wiki_path / "raw"),
+            "raw_source_count": _llm_wiki_count_files(wiki_path / "docs" / "raw") or _llm_wiki_count_files(wiki_path / "raw"),
             "last_updated": _llm_wiki_safe_iso(latest),
         })
         return base
@@ -3309,6 +3347,7 @@ def _build_llm_wiki_status() -> dict:
             "path_configured": False,
             "path_source": "unknown",
             "toggle_available": False,
+            "toggle_enabled": None,
             "toggle_reason": "Unable to inspect LLM Wiki status safely.",
             "docs_url": _LLM_WIKI_DOCS_URL,
             "error": type(exc).__name__,
