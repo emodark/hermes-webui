@@ -10,6 +10,7 @@ import re
 import threading
 import time
 import uuid
+from typing import Optional
 from contextlib import closing
 from pathlib import Path
 
@@ -29,7 +30,7 @@ from api.agent_sessions import (
 
 logger = logging.getLogger(__name__)
 CLI_VISIBLE_SESSION_LIMIT = 20
-_CLI_SESSIONS_CACHE_TTL_SECONDS = 5.0
+_CLI_SESSIONS_CACHE_TTL_SECONDS = 20.0
 _CLI_SESSIONS_CACHE_LOCK = threading.Lock()
 _CLI_SESSIONS_CACHE = {}
 
@@ -3401,6 +3402,10 @@ def _load_cli_sessions_uncached(hermes_home: Path, db_path: Path, lmdb_path, _cl
     return cli_sessions
 
 
+_CLI_SESSIONS_LAST_LOAD_TIME = 0.0
+_CLI_SESSIONS_MIN_RELOAD_INTERVAL = 30.0  # seconds - guard against cache-key churn from LMDB writes
+
+
 def get_cli_sessions() -> list:
     """Read CLI sessions from the agent's SQLite store and return them as
     dicts in a format the WebUI sidebar can render alongside local sessions.
@@ -3411,6 +3416,7 @@ def get_cli_sessions() -> list:
     hermes_home, db_path, lmdb_path, cli_profile, cache_key = _resolve_cli_sessions_context()
     ttl = _cli_sessions_cache_ttl_seconds()
     now = time.monotonic()
+    global _CLI_SESSIONS_LAST_LOAD_TIME
 
     if ttl > 0:
         with _CLI_SESSIONS_CACHE_LOCK:
@@ -3420,11 +3426,21 @@ def get_cli_sessions() -> list:
                 if expires_at > now:
                     return _copy_cli_sessions(cached_sessions)
                 _CLI_SESSIONS_CACHE.pop(cache_key, None)
+
+            # Time-based debounce: even if the cache-key changes (e.g. LMDB mtime
+            # ticked because the gateway wrote to it), don't re-scan the 1.4GB
+            # LMDB more often than once per MIN_RELOAD_INTERVAL.
+            seconds_since_last_load = now - _CLI_SESSIONS_LAST_LOAD_TIME
+            if _CLI_SESSIONS_LAST_LOAD_TIME > 0 and seconds_since_last_load < _CLI_SESSIONS_MIN_RELOAD_INTERVAL:
+                stale = _find_any_cached_cli_sessions()
+                if stale is not None:
+                    return stale
+
             try:
                 sessions = _load_cli_sessions_uncached(hermes_home, db_path, lmdb_path, cli_profile)
             except Exception as _cli_err:
                 logger.warning(
-                    "get_cli_sessions() failed — check state.db schema or path (%s): %s",
+                    "get_cli_sessions() failed - check state.db schema or path (%s): %s",
                     db_path, _cli_err,
                 )
                 return []
@@ -3432,16 +3448,30 @@ def get_cli_sessions() -> list:
                 time.monotonic() + ttl,
                 _copy_cli_sessions(sessions),
             )
+            _CLI_SESSIONS_LAST_LOAD_TIME = time.monotonic()
             return _copy_cli_sessions(sessions)
 
     try:
         return _load_cli_sessions_uncached(hermes_home, db_path, lmdb_path, cli_profile)
     except Exception as _cli_err:
         logger.warning(
-            "get_cli_sessions() failed — check state.db schema or path (%s): %s",
+            "get_cli_sessions() failed - check state.db schema or path (%s): %s",
             db_path, _cli_err,
         )
         return []
+
+
+def _find_any_cached_cli_sessions() -> Optional[list]:
+    """Return the most recent cached CLI sessions from any cache-key."""
+    best = None
+    best_expires = 0.0
+    now = time.monotonic()
+    for key, (expires_at, sessions) in list(_CLI_SESSIONS_CACHE.items()):
+        if expires_at > now:
+            if expires_at > best_expires:
+                best_expires = expires_at
+                best = sessions
+    return _copy_cli_sessions(best) if best is not None else None
 
 
 def _json_loads_if_string(value):
